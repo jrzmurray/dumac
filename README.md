@@ -15,6 +15,13 @@ dumac /tmp/
 11.5K   /tmp/
 ```
 
+Multiple paths and quoted glob patterns are supported (`*`, `?`, `[...]`, `**`). Hardlinks shared between paths are counted once.
+
+```bash
+dumac ~/Code ~/Downloads
+dumac 'target/**/build'
+```
+
 <br>
 
 ## Benchmarks

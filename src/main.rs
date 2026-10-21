@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
+use std::cell::RefCell;
 use std::env;
 use std::ffi::CString;
 use std::path::Path;
@@ -19,23 +20,26 @@ const MAX_FILE_HANDLES: usize = 224;
 // Sharded inode tracking
 const SHARD_COUNT: usize = 128;
 
-// File information for size calculation
-#[derive(Debug)]
-struct FileInfo {
-    blocks: i64,
-    inode: u64,
-}
+// Size of the attribute buffer handed to getattrlistbulk
+const ATTR_BUF_SIZE: usize = 128 * 1024;
 
 // Directory contents
 #[derive(Debug)]
 struct DirInfo {
-    files: Vec<FileInfo>,
+    // Blocks used by the files in this directory (hardlinks already deduplicated)
+    blocks: i64,
+    // Full paths of the subdirectories
     subdirs: Vec<String>,
 }
 
+thread_local! {
+    // Reused per-thread so we don't zero 128 KiB for every directory
+    static ATTR_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; ATTR_BUF_SIZE]);
+}
+
 // Global sharded inode set for hardlink deduplication
-static SEEN_INODES: LazyLock<[Mutex<HashSet<u64>>; SHARD_COUNT]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(HashSet::new())));
+static SEEN_INODES: LazyLock<[Mutex<FxHashSet<u64>>; SHARD_COUNT]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(FxHashSet::default())));
 
 fn shard_for_inode(inode: u64) -> usize {
     ((inode >> 8) % SHARD_COUNT as u64) as usize
@@ -105,15 +109,59 @@ fn format_size(blocks: i64) -> String {
 fn is_dot_or_dotdot(filename: &str) -> bool {
     filename == "." || filename == ".."
 }
+
+fn has_glob_chars(arg: &str) -> bool {
+    arg.contains(['*', '?', '['])
+}
+
+// Expand glob patterns in the arguments. Arguments that exist literally, or that
+// contain no glob characters, are passed through untouched. Returns the paths to
+// measure and any error messages (patterns with no matches, invalid patterns).
+pub fn expand_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: true,
+    };
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+
+    for arg in args {
+        if !has_glob_chars(arg) || Path::new(arg).exists() {
+            paths.push(arg.clone());
+            continue;
+        }
+        match glob::glob_with(arg, options) {
+            Ok(matches) => {
+                let before = paths.len();
+                paths.extend(
+                    matches
+                        .filter_map(Result::ok)
+                        .map(|p| p.to_string_lossy().into_owned()),
+                );
+                if paths.len() == before {
+                    errors.push(format!("{}: No such file or directory", arg));
+                }
+            }
+            Err(e) => errors.push(format!("{}: invalid pattern: {}", arg, e.msg)),
+        }
+    }
+    (paths, errors)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("usage: {} directory", args[0]);
+        eprintln!("usage: {} path [path ...]", args[0]);
         std::process::exit(1);
     }
 
-    let root_dir = &args[1];
+    let (roots, expand_errors) = expand_args(&args[1..]);
+    let mut failed = !expand_errors.is_empty();
+    for e in &expand_errors {
+        eprintln!("{}: {}", args[0], e);
+    }
 
     let max_threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -122,55 +170,56 @@ fn main() {
         .min(MAX_FILE_HANDLES);
     let pool = rayon::ThreadPoolBuilder::new()
         // Larger than default stack size to handle deep directory trees
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(4 * 1024 * 1024)
         .num_threads(max_threads)
         .build()
         .expect("Failed to build thread pool");
 
-    let result = pool.install(|| calculate_size(root_dir.clone()));
-
-    match result {
-        Ok(total_blocks) => {
-            println!("{}\t{}", format_size(total_blocks), root_dir);
-        }
-        Err(e) => {
-            eprintln!("{}: {}", args[0], e);
-            std::process::exit(1);
+    for root in roots {
+        match pool.install(|| size_of_path(root.clone())) {
+            Ok(total_blocks) => println!("{}\t{}", format_size(total_blocks), root),
+            Err(e) => {
+                eprintln!("{}: {}", args[0], e);
+                failed = true;
+            }
         }
     }
+
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+// Size of a command line argument: directories are walked, anything else is
+// measured directly. Unreadable paths fall through to calculate_size for its error.
+pub fn size_of_path(path: String) -> Result<i64, String> {
+    let c_path = CString::new(path.as_str()).map_err(|_| format!("{}: Invalid path", path))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(c_path.as_ptr(), &mut st) } == 0
+        && (st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+    {
+        let blocks = if st.st_nlink > 1 {
+            check_and_add_inode(st.st_ino, st.st_blocks)
+        } else {
+            st.st_blocks
+        };
+        return Ok(blocks);
+    }
+    calculate_size(path)
 }
 
 // Calculate total size recursively using rayon work stealing
 pub fn calculate_size(root_dir: String) -> Result<i64, String> {
-    // Get directory contents
     let dir_info = get_dir_info(&root_dir)?;
 
-    let mut all_inodes = Vec::new();
-
-    // Process files in this directory, deduplicating by inode
-    let total_size: i64 = dir_info
-        .files
-        .iter()
-        .map(|file| {
-            let blocks = check_and_add_inode(file.inode, file.blocks);
-            all_inodes.push(file.inode);
-            blocks
-        })
-        .sum();
-
     // Process subdirectories in parallel
-    let subdir_size = if !dir_info.subdirs.is_empty() {
+    let subdir_size: i64 = if dir_info.subdirs.is_empty() {
+        0
+    } else {
         dir_info
             .subdirs
             .into_par_iter()
-            .map(|subdir| {
-                let subdir_path = Path::new(&root_dir)
-                    .join(&subdir)
-                    .to_string_lossy()
-                    .to_string();
-                calculate_size(subdir_path)
-            })
-            .map(|result| match result {
+            .map(|subdir_path| match calculate_size(subdir_path) {
                 Ok(size) => size,
                 Err(e) => {
                     eprintln!("dumac: {}", e);
@@ -178,11 +227,9 @@ pub fn calculate_size(root_dir: String) -> Result<i64, String> {
                 }
             })
             .sum()
-    } else {
-        0
     };
 
-    Ok(total_size + subdir_size)
+    Ok(dir_info.blocks + subdir_size)
 }
 
 fn get_dir_info(path: &str) -> Result<DirInfo, String> {
@@ -200,6 +247,16 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
         return Err(format!("{}: {}", path, error_msg));
     }
 
+    let result = ATTR_BUF.with(|buf| read_dir_entries(path, dirfd, &mut buf.borrow_mut()));
+
+    // Close directory
+    unsafe {
+        libc::close(dirfd);
+    }
+    result
+}
+
+fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Result<DirInfo, String> {
     // Set up attribute list for getattrlistbulk
     let mut attrlist = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT as u16,
@@ -211,12 +268,18 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
             | libc::ATTR_CMN_FILEID,
         volattr: 0,
         dirattr: 0,
-        fileattr: libc::ATTR_FILE_ALLOCSIZE,
+        fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE,
         forkattr: 0,
     };
 
-    let mut attrbuf = [0u8; 128 * 1024];
-    let mut files = Vec::new();
+    // Prefix (with trailing separator) shared by every child path
+    let mut prefix = String::with_capacity(path.len() + 1);
+    prefix.push_str(path);
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+
+    let mut blocks: i64 = 0;
     let mut subdirs = Vec::new();
 
     loop {
@@ -256,8 +319,8 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
                     std::ptr::read_unaligned(field_ptr as *const libc::attribute_set_t);
                 field_ptr = field_ptr.add(std::mem::size_of::<libc::attribute_set_t>());
 
-                // Extract filename
-                let mut filename: Option<String> = None;
+                // Extract filename (borrowed from the buffer, no allocation)
+                let mut filename: Option<&str> = None;
                 if returned_attrs.commonattr & libc::ATTR_CMN_NAME != 0 {
                     let name_start = field_ptr; // Save start of attrreference_t
                     let name_info =
@@ -275,7 +338,7 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
                                 entry_ptr = entry_ptr.add(entry_length as usize);
                                 continue;
                             }
-                            filename = Some(name_str.to_string());
+                            filename = Some(name_str);
                         }
                     }
                 }
@@ -285,8 +348,8 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
                     let error_code = std::ptr::read_unaligned(field_ptr as *const u32);
                     field_ptr = field_ptr.add(std::mem::size_of::<u32>());
                     if error_code != 0 {
-                        if let Some(name) = &filename {
-                            eprintln!("cannot access '{}/{}': error {}", path, name, error_code);
+                        if let Some(name) = filename {
+                            eprintln!("cannot access '{}{}': error {}", prefix, name, error_code);
                         }
                         entry_ptr = entry_ptr.add(entry_length as usize);
                         continue;
@@ -311,27 +374,46 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
                     0
                 };
 
+                // Link count comes first among the file attributes. Only files with
+                // more than one link can be duplicates, so only they touch the inode set.
+                let mut nlink: u32 = 2; // assume shared if the kernel didn't say
+                if obj_type == VREG || obj_type == VLNK {
+                    if returned_attrs.fileattr & libc::ATTR_FILE_LINKCOUNT != 0 {
+                        nlink = std::ptr::read_unaligned(field_ptr as *const u32);
+                        field_ptr = field_ptr.add(std::mem::size_of::<u32>());
+                    }
+                }
+
                 // Handle different file types
                 match obj_type {
                     VREG => {
                         // Regular file - get allocation size
                         if returned_attrs.fileattr & libc::ATTR_FILE_ALLOCSIZE != 0 {
                             let alloc_size = std::ptr::read_unaligned(field_ptr as *const i64);
-                            files.push(FileInfo {
-                                blocks: blocks_from_bytes(alloc_size),
-                                inode,
-                            });
+                            let file_blocks = blocks_from_bytes(alloc_size);
+                            blocks += if nlink > 1 {
+                                check_and_add_inode(inode, file_blocks)
+                            } else {
+                                file_blocks
+                            };
                         }
                     }
                     VDIR => {
-                        // Directory - add to subdirectories list
+                        // Directory - record its full path
                         if let Some(name) = filename {
-                            subdirs.push(name);
+                            let mut child = String::with_capacity(prefix.len() + name.len());
+                            child.push_str(&prefix);
+                            child.push_str(name);
+                            subdirs.push(child);
                         }
                     }
                     VLNK => {
                         // Symlink - count the link itself as 1 (du default behavior)
-                        files.push(FileInfo { blocks: 1, inode });
+                        blocks += if nlink > 1 {
+                            check_and_add_inode(inode, 1)
+                        } else {
+                            1
+                        };
                     }
                     _ => {
                         // Other file types (devices, etc.) - treat as zero-size
@@ -344,10 +426,5 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
         }
     }
 
-    // Close directory
-    unsafe {
-        libc::close(dirfd);
-    }
-
-    Ok(DirInfo { files, subdirs })
+    Ok(DirInfo { blocks, subdirs })
 }

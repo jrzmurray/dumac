@@ -123,3 +123,127 @@ fn test_hardlink_deduplication() {
     // Verify the original size is reasonable (at least 4 blocks for 2048 bytes)
     assert!(size_original >= 4, "Should have at least 4 blocks for 2048 bytes, got {}", size_original);
 } 
+
+use main::{expand_args, size_of_path};
+use std::process::Command;
+
+fn write_file(path: &std::path::Path, bytes: usize) {
+    let mut f = File::create(path).expect("Failed to create file");
+    f.write_all(&vec![b'a'; bytes]).expect("Failed to write file");
+}
+
+#[test]
+fn test_expand_args_glob_matches() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    fs::create_dir(root.join("sub1")).unwrap();
+    fs::create_dir(root.join("sub2")).unwrap();
+    fs::create_dir(root.join("other")).unwrap();
+    fs::create_dir(root.join(".hidden")).unwrap();
+
+    let pattern = format!("{}/sub*", root.display());
+    let (paths, errors) = expand_args(&[pattern]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    assert_eq!(
+        paths,
+        vec![
+            format!("{}/sub1", root.display()),
+            format!("{}/sub2", root.display())
+        ]
+    );
+
+    // Leading dots are not matched by a bare wildcard, like a shell
+    let (paths, _) = expand_args(&[format!("{}/*", root.display())]);
+    assert!(paths.iter().all(|p| !p.contains(".hidden")));
+}
+
+#[test]
+fn test_expand_args_recursive_glob() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    fs::create_dir_all(root.join("a/build")).unwrap();
+    fs::create_dir_all(root.join("b/c/build")).unwrap();
+
+    let (paths, errors) = expand_args(&[format!("{}/**/build", root.display())]);
+    assert!(errors.is_empty());
+    assert_eq!(paths.len(), 2, "got {:?}", paths);
+}
+
+#[test]
+fn test_expand_args_no_match_and_literal() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+
+    let (paths, errors) = expand_args(&[format!("{}/nothing*", root.display())]);
+    assert!(paths.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("No such file or directory"));
+
+    // A literal path that happens to contain glob characters is not expanded
+    let weird = root.join("we[ir]d*");
+    fs::create_dir(&weird).unwrap();
+    let arg = weird.to_string_lossy().to_string();
+    let (paths, errors) = expand_args(&[arg.clone()]);
+    assert!(errors.is_empty());
+    assert_eq!(paths, vec![arg]);
+
+    // Plain nonexistent paths pass through so the size step reports the error
+    let (paths, errors) = expand_args(&["/definitely/not/here".to_string()]);
+    assert!(errors.is_empty());
+    assert_eq!(paths.len(), 1);
+}
+
+#[test]
+fn test_size_of_path_file_root() {
+    main::clear_seen_inodes();
+    let temp_dir = TempDir::new().unwrap();
+    let file = temp_dir.path().join("f.txt");
+    write_file(&file, 4096);
+
+    let blocks = size_of_path(file.to_string_lossy().to_string()).unwrap();
+    assert!(blocks >= 8, "4096 bytes should be at least 8 blocks, got {}", blocks);
+}
+
+#[test]
+fn test_hardlink_shared_across_roots_counted_once() {
+    main::clear_seen_inodes();
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    write_file(&root.join("a/file"), 8192);
+    hard_link(root.join("a/file"), root.join("b/link")).unwrap();
+
+    let first = size_of_path(root.join("a").to_string_lossy().to_string()).unwrap();
+    let second = size_of_path(root.join("b").to_string_lossy().to_string()).unwrap();
+    assert!(first >= 16);
+    assert_eq!(second, 0, "hardlink already counted in the first root");
+}
+
+#[test]
+fn test_cli_multiple_paths_and_quoted_glob() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    fs::create_dir(root.join("sub1")).unwrap();
+    fs::create_dir(root.join("sub2")).unwrap();
+    write_file(&root.join("sub1/x"), 10_000);
+    write_file(&root.join("sub2/y"), 10_000);
+
+    let pattern = format!("{}/sub*", root.display());
+    let out = Command::new(env!("CARGO_BIN_EXE_dumac"))
+        .arg(&pattern)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 2, "got {:?}", stdout);
+    assert!(stdout.contains("sub1") && stdout.contains("sub2"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_dumac"))
+        .arg(root.join("sub1"))
+        .arg(format!("{}/nomatch*", root.display()))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "no-match pattern should fail");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+}
