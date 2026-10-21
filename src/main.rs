@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::env;
 use std::ffi::CString;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
 // macOS-specific constants not in libc crate
@@ -13,6 +14,7 @@ const VNON: u32 = 0;
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
 const VLNK: u32 = 5;
+const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
 
 // Max file handles open
 const MAX_FILE_HANDLES: usize = 224;
@@ -28,8 +30,23 @@ const ATTR_BUF_SIZE: usize = 128 * 1024;
 struct DirInfo {
     // Blocks used by the files in this directory (hardlinks already deduplicated)
     blocks: i64,
-    // Full paths of the subdirectories
-    subdirs: Vec<String>,
+    // Subdirectories to descend into
+    subdirs: Vec<SubDir>,
+}
+
+#[derive(Debug)]
+struct SubDir {
+    // Full path
+    path: String,
+    // The entry is a mount point, so the filesystem underneath may differ
+    mount: bool,
+}
+
+// Count each APFS clone group's shared blocks once instead of once per file
+static DEDUPE_CLONES: AtomicBool = AtomicBool::new(false);
+
+pub fn set_dedupe_clones(enabled: bool) {
+    DEDUPE_CLONES.store(enabled, Ordering::Relaxed);
 }
 
 thread_local! {
@@ -37,9 +54,18 @@ thread_local! {
     static ATTR_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; ATTR_BUF_SIZE]);
 }
 
+type ShardedSet = [Mutex<FxHashSet<u64>>; SHARD_COUNT];
+
+fn new_sharded_set() -> ShardedSet {
+    std::array::from_fn(|_| Mutex::new(FxHashSet::default()))
+}
+
 // Global sharded inode set for hardlink deduplication
-static SEEN_INODES: LazyLock<[Mutex<FxHashSet<u64>>; SHARD_COUNT]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(FxHashSet::default())));
+static SEEN_INODES: LazyLock<ShardedSet> = LazyLock::new(new_sharded_set);
+
+// Global sharded set of APFS clone ids whose shared blocks have been counted.
+// Kept apart from inodes: a clone id is the inode of the original file.
+static SEEN_CLONES: LazyLock<ShardedSet> = LazyLock::new(new_sharded_set);
 
 fn shard_for_inode(inode: u64) -> usize {
     ((inode >> 8) % SHARD_COUNT as u64) as usize
@@ -48,20 +74,43 @@ fn shard_for_inode(inode: u64) -> usize {
 // Clear all seen inodes (for testing)
 #[cfg(test)]
 pub fn clear_seen_inodes() {
-    for shard in SEEN_INODES.iter() {
+    for shard in SEEN_INODES.iter().chain(SEEN_CLONES.iter()) {
         shard.lock().clear();
     }
 }
 
+// Returns true the first time a key is inserted
+fn insert_new(set: &ShardedSet, key: u64) -> bool {
+    set[shard_for_inode(key)].lock().insert(key)
+}
+
 // Returns the blocks to add (blocks if newly seen, 0 if already seen)
 fn check_and_add_inode(inode: u64, blocks: i64) -> i64 {
-    let shard_idx = shard_for_inode(inode);
-    let mut seen = SEEN_INODES[shard_idx].lock();
-    if seen.insert(inode) {
+    if insert_new(&SEEN_INODES, inode) {
         blocks // Inode was newly added, count the blocks
     } else {
         0 // Inode already seen, don't count
     }
+}
+
+// Blocks a file adds to the total. Hardlinks are counted once. With clone
+// deduplication on, a file's private blocks always count, while the blocks it
+// shares with its clones count once per clone group (an estimate when clones
+// have diverged in different places).
+fn file_blocks_to_add(inode: u64, nlink: u32, blocks: i64, clone: Option<(i64, u64)>) -> i64 {
+    let mut counted = if nlink > 1 {
+        check_and_add_inode(inode, blocks)
+    } else {
+        blocks
+    };
+    if let Some((private_bytes, clone_id)) = clone {
+        let private_blocks = blocks_from_bytes(private_bytes).min(counted);
+        let shared = counted - private_blocks;
+        if shared > 0 {
+            counted = private_blocks + if insert_new(&SEEN_CLONES, clone_id) { shared } else { 0 };
+        }
+    }
+    counted
 }
 
 // Convert bytes to 512-byte blocks (du default)
@@ -183,15 +232,42 @@ fn worker_threads() -> usize {
         .min(MAX_FILE_HANDLES)
 }
 
+// Split leading options from paths. Only "--" prefixed options exist, so a path
+// starting with a single dash still works; "--" ends option parsing.
+pub fn parse_flags(args: &[String]) -> Result<(bool, Vec<String>), String> {
+    let mut dedupe_clones = false;
+    let mut operands = Vec::new();
+    let mut options_done = false;
+    for arg in args {
+        match arg.as_str() {
+            "--" if !options_done => options_done = true,
+            "--dedupe-clones" if !options_done => dedupe_clones = true,
+            a if !options_done && a.starts_with("--") => {
+                return Err(format!("unrecognized option '{}'", a))
+            }
+            _ => operands.push(arg.clone()),
+        }
+    }
+    Ok((dedupe_clones, operands))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("usage: {} path [path ...]", args[0]);
+    let (dedupe_clones, operands) = match parse_flags(&args[1..]) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("{}: {}", args[0], msg);
+            std::process::exit(1);
+        }
+    };
+    if operands.is_empty() {
+        eprintln!("usage: {} [--dedupe-clones] path [path ...]", args[0]);
         std::process::exit(1);
     }
+    set_dedupe_clones(dedupe_clones);
 
-    let (roots, expand_errors) = expand_args(&args[1..]);
+    let (roots, expand_errors) = expand_args(&operands);
     let mut failed = !expand_errors.is_empty();
     for e in &expand_errors {
         eprintln!("{}: {}", args[0], e);
@@ -238,9 +314,30 @@ pub fn size_of_path(path: String) -> Result<i64, String> {
     calculate_size(path)
 }
 
+// True when the entry count reported for a directory on this path can be trusted
+// to mean "empty". Only done for writable APFS: the sealed system volume exposes
+// firmlinks to the data volume (/Users, /Library, ...) as directories that report
+// zero entries but open onto real content.
+fn volume_trusts_empty(path: &str) -> bool {
+    let Ok(c_path) = CString::new(path) else {
+        return false;
+    };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    let is_apfs = fs.f_fstypename.starts_with(&[b'a' as _, b'p' as _, b'f' as _, b's' as _, 0]);
+    is_apfs && (fs.f_flags & libc::MNT_RDONLY as u32) == 0
+}
+
 // Calculate total size recursively using rayon work stealing
 pub fn calculate_size(root_dir: String) -> Result<i64, String> {
-    let dir_info = get_dir_info(&root_dir)?;
+    let trust_empty = volume_trusts_empty(&root_dir);
+    walk(root_dir, trust_empty)
+}
+
+fn walk(path: String, trust_empty: bool) -> Result<i64, String> {
+    let dir_info = get_dir_info(&path, trust_empty)?;
 
     // Process subdirectories in parallel
     let subdir_size: i64 = if dir_info.subdirs.is_empty() {
@@ -249,11 +346,19 @@ pub fn calculate_size(root_dir: String) -> Result<i64, String> {
         dir_info
             .subdirs
             .into_par_iter()
-            .map(|subdir_path| match calculate_size(subdir_path) {
-                Ok(size) => size,
-                Err(e) => {
-                    eprintln!("dumac: {}", e);
-                    0
+            .map(|subdir| {
+                // A mount point may sit on a different filesystem than its parent
+                let trust = if subdir.mount {
+                    volume_trusts_empty(&subdir.path)
+                } else {
+                    trust_empty
+                };
+                match walk(subdir.path, trust) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        eprintln!("dumac: {}", e);
+                        0
+                    }
                 }
             })
             .sum()
@@ -262,7 +367,7 @@ pub fn calculate_size(root_dir: String) -> Result<i64, String> {
     Ok(dir_info.blocks + subdir_size)
 }
 
-fn get_dir_info(path: &str) -> Result<DirInfo, String> {
+fn get_dir_info(path: &str, trust_empty: bool) -> Result<DirInfo, String> {
     // Open directory
     let c_path = CString::new(path).map_err(|_| format!("{}: Invalid path", path))?;
     let dirfd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
@@ -277,7 +382,7 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
         return Err(format!("{}: {}", path, error_msg));
     }
 
-    let result = ATTR_BUF.with(|buf| read_dir_entries(path, dirfd, &mut buf.borrow_mut()));
+    let result = ATTR_BUF.with(|buf| read_dir_entries(path, dirfd, &mut buf.borrow_mut(), trust_empty));
 
     // Close directory
     unsafe {
@@ -286,7 +391,14 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
     result
 }
 
-fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Result<DirInfo, String> {
+fn read_dir_entries(
+    path: &str,
+    dirfd: libc::c_int,
+    attrbuf: &mut [u8],
+    trust_empty: bool,
+) -> Result<DirInfo, String> {
+    let dedupe_clones = DEDUPE_CLONES.load(Ordering::Relaxed);
+
     // Set up attribute list for getattrlistbulk
     let mut attrlist = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT as u16,
@@ -297,9 +409,20 @@ fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Resul
             | libc::ATTR_CMN_OBJTYPE
             | libc::ATTR_CMN_FILEID,
         volattr: 0,
-        dirattr: 0,
+        // Entry count and mount status let us skip empty directories entirely
+        dirattr: libc::ATTR_DIR_ENTRYCOUNT | libc::ATTR_DIR_MOUNTSTATUS,
         fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE,
-        forkattr: 0,
+        // With FSOPT_ATTR_CMN_EXTENDED this group is the extended common attributes
+        forkattr: if dedupe_clones {
+            libc::ATTR_CMNEXT_PRIVATESIZE | libc::ATTR_CMNEXT_CLONEID
+        } else {
+            0
+        },
+    };
+    let options = if dedupe_clones {
+        libc::FSOPT_ATTR_CMN_EXTENDED as u64
+    } else {
+        0
     };
 
     // Prefix (with trailing separator) shared by every child path
@@ -319,7 +442,7 @@ fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Resul
                 &mut attrlist as *mut libc::attrlist as *mut libc::c_void,
                 attrbuf.as_mut_ptr() as *mut libc::c_void,
                 attrbuf.len(),
-                0,
+                options,
             )
         };
 
@@ -404,6 +527,20 @@ fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Resul
                     0
                 };
 
+                // Directory attributes: entry count, then mount status
+                let mut entry_count: Option<u32> = None;
+                let mut mount_status: Option<u32> = None;
+                if obj_type == VDIR {
+                    if returned_attrs.dirattr & libc::ATTR_DIR_ENTRYCOUNT != 0 {
+                        entry_count = Some(std::ptr::read_unaligned(field_ptr as *const u32));
+                        field_ptr = field_ptr.add(std::mem::size_of::<u32>());
+                    }
+                    if returned_attrs.dirattr & libc::ATTR_DIR_MOUNTSTATUS != 0 {
+                        mount_status = Some(std::ptr::read_unaligned(field_ptr as *const u32));
+                        field_ptr = field_ptr.add(std::mem::size_of::<u32>());
+                    }
+                }
+
                 // Link count comes first among the file attributes. Only files with
                 // more than one link can be duplicates, so only they touch the inode set.
                 let mut nlink: u32 = 2; // assume shared if the kernel didn't say
@@ -423,21 +560,36 @@ fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Resul
                         // zero, which is what du counts.
                         if returned_attrs.fileattr & libc::ATTR_FILE_ALLOCSIZE != 0 {
                             let alloc_size = std::ptr::read_unaligned(field_ptr as *const i64);
+                            field_ptr = field_ptr.add(std::mem::size_of::<i64>());
                             let file_blocks = blocks_from_bytes(alloc_size);
-                            blocks += if nlink > 1 {
-                                check_and_add_inode(inode, file_blocks)
-                            } else {
-                                file_blocks
-                            };
+
+                            // Extended attributes follow the file group: private size, clone id
+                            let mut clone: Option<(i64, u64)> = None;
+                            if dedupe_clones
+                                && returned_attrs.forkattr & libc::ATTR_CMNEXT_PRIVATESIZE != 0
+                                && returned_attrs.forkattr & libc::ATTR_CMNEXT_CLONEID != 0
+                            {
+                                let private = std::ptr::read_unaligned(field_ptr as *const i64);
+                                field_ptr = field_ptr.add(std::mem::size_of::<i64>());
+                                let clone_id = std::ptr::read_unaligned(field_ptr as *const u64);
+                                clone = Some((private, clone_id));
+                            }
+                            blocks += file_blocks_to_add(inode, nlink, file_blocks, clone);
                         }
                     }
                     VDIR => {
-                        // Directory - record its full path
-                        if let Some(name) = filename {
+                        // Directory - record its full path, unless it is provably empty.
+                        // A mount point or autofs trigger can report zero entries yet
+                        // have content mounted over it.
+                        let mount = mount_status.map_or(false, |m| m & libc::DIR_MNTSTATUS_MNTPOINT != 0);
+                        let provably_empty = trust_empty
+                            && entry_count == Some(0)
+                            && mount_status.map_or(false, |m| m & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) == 0);
+                        if let (Some(name), false) = (filename, provably_empty) {
                             let mut child = String::with_capacity(prefix.len() + name.len());
                             child.push_str(&prefix);
                             child.push_str(name);
-                            subdirs.push(child);
+                            subdirs.push(SubDir { path: child, mount });
                         }
                     }
                     _ => {

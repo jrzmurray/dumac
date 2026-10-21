@@ -1,7 +1,16 @@
 use std::fs::{self, File, hard_link};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
+
+// The inode and clone sets are process-global, so tests that clear or depend on
+// them must not overlap.
+static GLOBAL_STATE: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // Import the main module
 #[path = "../src/main.rs"]
@@ -11,6 +20,7 @@ use main::calculate_size;
 
 #[test]
 fn test_basic_file_size_calculation() {
+    let _guard = serial();
     // Clear the seen inodes cache to ensure test isolation
     main::clear_seen_inodes();
     
@@ -43,6 +53,7 @@ fn test_basic_file_size_calculation() {
 
 #[test]
 fn test_nested_directories() {
+    let _guard = serial();
     // Clear the seen inodes cache to ensure test isolation
     main::clear_seen_inodes();
     
@@ -75,6 +86,7 @@ fn test_nested_directories() {
 
 #[test]
 fn test_hardlink_deduplication() {
+    let _guard = serial();
     // Clear the seen inodes cache to ensure test isolation
     main::clear_seen_inodes();
     
@@ -134,6 +146,7 @@ fn write_file(path: &std::path::Path, bytes: usize) {
 
 #[test]
 fn test_expand_args_glob_matches() {
+    let _guard = serial();
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path();
     fs::create_dir(root.join("sub1")).unwrap();
@@ -159,6 +172,7 @@ fn test_expand_args_glob_matches() {
 
 #[test]
 fn test_expand_args_recursive_glob() {
+    let _guard = serial();
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path();
     fs::create_dir_all(root.join("a/build")).unwrap();
@@ -171,6 +185,7 @@ fn test_expand_args_recursive_glob() {
 
 #[test]
 fn test_expand_args_no_match_and_literal() {
+    let _guard = serial();
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path();
 
@@ -195,6 +210,7 @@ fn test_expand_args_no_match_and_literal() {
 
 #[test]
 fn test_size_of_path_file_root() {
+    let _guard = serial();
     main::clear_seen_inodes();
     let temp_dir = TempDir::new().unwrap();
     let file = temp_dir.path().join("f.txt");
@@ -206,6 +222,7 @@ fn test_size_of_path_file_root() {
 
 #[test]
 fn test_hardlink_shared_across_roots_counted_once() {
+    let _guard = serial();
     main::clear_seen_inodes();
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path();
@@ -222,6 +239,7 @@ fn test_hardlink_shared_across_roots_counted_once() {
 
 #[test]
 fn test_cli_multiple_paths_and_quoted_glob() {
+    let _guard = serial();
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path();
     fs::create_dir(root.join("sub1")).unwrap();
@@ -250,6 +268,7 @@ fn test_cli_multiple_paths_and_quoted_glob() {
 
 #[test]
 fn test_symlinks_report_allocated_size() {
+    let _guard = serial();
     main::clear_seen_inodes();
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -282,4 +301,122 @@ fn test_symlinks_report_allocated_size() {
         total_blocks, expected_blocks,
         "symlinks should contribute their real allocated size, not a fixed block each"
     );
+}
+
+
+use main::{parse_flags, set_dedupe_clones};
+
+#[test]
+fn test_parse_flags() {
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let (clones, paths) = parse_flags(&args(&["--dedupe-clones", "a", "b"])).unwrap();
+    assert!(clones);
+    assert_eq!(paths, args(&["a", "b"]));
+
+    let (clones, paths) = parse_flags(&args(&["a"])).unwrap();
+    assert!(!clones);
+    assert_eq!(paths, args(&["a"]));
+
+    // "--" ends option parsing so odd paths remain reachable
+    let (clones, paths) = parse_flags(&args(&["--", "--dedupe-clones"])).unwrap();
+    assert!(!clones);
+    assert_eq!(paths, args(&["--dedupe-clones"]));
+
+    assert!(parse_flags(&args(&["--nope", "a"])).is_err());
+}
+
+#[test]
+fn test_empty_directories_do_not_change_totals() {
+    let _guard = serial();
+    main::clear_seen_inodes();
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+
+    // Empty dirs, a chain of empty dirs, a dir holding only a dotfile, and a dir
+    // holding only a subdirectory that holds a file.
+    fs::create_dir(root.join("empty")).unwrap();
+    fs::create_dir_all(root.join("chain/a/b/c")).unwrap();
+    fs::create_dir(root.join("dotonly")).unwrap();
+    write_file(&root.join("dotonly/.hidden"), 5000);
+    fs::create_dir_all(root.join("wrapper/inner")).unwrap();
+    write_file(&root.join("wrapper/inner/f"), 9000);
+    write_file(&root.join("top"), 3000);
+
+    let expected: i64 = ["dotonly/.hidden", "wrapper/inner/f", "top"]
+        .iter()
+        .map(|f| fs::metadata(root.join(f)).unwrap().blocks() as i64)
+        .sum();
+    let total = calculate_size(root.to_string_lossy().to_string()).unwrap();
+    assert_eq!(total, expected);
+}
+
+#[test]
+fn test_dedupe_clones_counts_shared_blocks_once() {
+    let _guard = serial();
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    fs::create_dir(root.join("d")).unwrap();
+    let original = root.join("d/original");
+    let mut data = vec![0u8; 1 << 20];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i.wrapping_mul(2654435761) >> 7) as u8; // incompressible-ish, no sparse holes
+    }
+    File::create(&original).unwrap().write_all(&data).unwrap();
+
+    let cloned = ["c1", "c2"].iter().all(|name| {
+        Command::new("cp")
+            .arg("-c")
+            .arg(&original)
+            .arg(root.join("d").join(name))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    if !cloned {
+        eprintln!("skipping: filesystem does not support clonefile");
+        return;
+    }
+
+    let path = root.join("d").to_string_lossy().to_string();
+    main::clear_seen_inodes();
+    set_dedupe_clones(false);
+    let plain = calculate_size(path.clone()).unwrap();
+
+    main::clear_seen_inodes();
+    set_dedupe_clones(true);
+    let deduped = calculate_size(path).unwrap();
+    set_dedupe_clones(false);
+
+    let one_file = (1 << 20) / 512;
+    assert!(plain >= 3 * one_file, "plain total counts every clone: {}", plain);
+    assert!(
+        deduped < 2 * one_file,
+        "clones should share one copy: plain {} deduped {}",
+        plain,
+        deduped
+    );
+}
+
+#[test]
+fn test_cli_dedupe_clones_flag() {
+    let _guard = serial();
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    write_file(&root.join("f"), 10_000);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_dumac"))
+        .arg("--dedupe-clones")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_dumac"))
+        .arg("--unknown")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }
