@@ -386,8 +386,11 @@ fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Resul
 
                 // Handle different file types
                 match obj_type {
-                    VREG => {
-                        // Regular file - get allocation size
+                    VREG | VLNK => {
+                        // File attributes cover every non-directory object, symlinks
+                        // included, so use the reported allocation rather than assuming
+                        // a block per link. APFS stores short targets inline and reports
+                        // zero, which is what du counts.
                         if returned_attrs.fileattr & libc::ATTR_FILE_ALLOCSIZE != 0 {
                             let alloc_size = std::ptr::read_unaligned(field_ptr as *const i64);
                             let file_blocks = blocks_from_bytes(alloc_size);
@@ -406,14 +409,6 @@ fn read_dir_entries(path: &str, dirfd: libc::c_int, attrbuf: &mut [u8]) -> Resul
                             child.push_str(name);
                             subdirs.push(child);
                         }
-                    }
-                    VLNK => {
-                        // Symlink - count the link itself as 1 (du default behavior)
-                        blocks += if nlink > 1 {
-                            check_and_add_inode(inode, 1)
-                        } else {
-                            1
-                        };
                     }
                     _ => {
                         // Other file types (devices, etc.) - treat as zero-size
