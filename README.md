@@ -22,6 +22,8 @@ dumac ~/Code ~/Downloads
 dumac 'target/**/build'
 ```
 
+The worker pool defaults to the number of performance cores (more threads mostly contend on kernel locks). Set `DUMAC_THREADS=n` to override.
+
 <br>
 
 ## Benchmarks

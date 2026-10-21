@@ -149,6 +149,40 @@ pub fn expand_args(args: &[String]) -> (Vec<String>, Vec<String>) {
     (paths, errors)
 }
 
+// Read an integer sysctl by name (macOS)
+fn sysctl_usize(name: &str) -> Option<usize> {
+    let c_name = CString::new(name).ok()?;
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value as usize)
+}
+
+// The walk is bound by kernel directory-lookup locks, so threads beyond the number
+// of fast physical cores mostly spin: measured on an M-series Mac, 6 threads beat 12
+// on wall time while using about half the CPU. Prefer performance cores, then
+// physical cores, then logical cores. DUMAC_THREADS overrides for tuning.
+fn worker_threads() -> usize {
+    env::var("DUMAC_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .or_else(|| sysctl_usize("hw.perflevel0.physicalcpu"))
+        .or_else(|| sysctl_usize("hw.physicalcpu"))
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1)
+        // Limit to MAX_FILE_HANDLES to avoid file handle limit errors
+        .min(MAX_FILE_HANDLES)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -163,15 +197,11 @@ fn main() {
         eprintln!("{}: {}", args[0], e);
     }
 
-    let max_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        // Limit to MAX_FILE_HANDLES to avoid file handle limit errors
-        .min(MAX_FILE_HANDLES);
+    let pool_threads = worker_threads();
     let pool = rayon::ThreadPoolBuilder::new()
         // Larger than default stack size to handle deep directory trees
         .stack_size(4 * 1024 * 1024)
-        .num_threads(max_threads)
+        .num_threads(pool_threads)
         .build()
         .expect("Failed to build thread pool");
 
