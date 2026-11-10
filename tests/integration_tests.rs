@@ -304,26 +304,121 @@ fn test_symlinks_report_allocated_size() {
 }
 
 
-use main::{parse_flags, set_dedupe_clones};
+use main::{parse_block_size, parse_flags, set_dedupe_clones, SizeFormat};
+
+// du's default: 512-byte blocks
+const BLOCKS_512: SizeFormat = SizeFormat::Blocks { unit: 512 };
+
+fn args(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
 
 #[test]
 fn test_parse_flags() {
-    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-
-    let (clones, paths) = parse_flags(&args(&["--dedupe-clones", "a", "b"])).unwrap();
-    assert!(clones);
+    let (opts, paths) = parse_flags(&args(&["--dedupe-clones", "a", "b"]), BLOCKS_512).unwrap();
+    assert!(opts.dedupe_clones);
     assert_eq!(paths, args(&["a", "b"]));
 
-    let (clones, paths) = parse_flags(&args(&["a"])).unwrap();
-    assert!(!clones);
+    let (opts, paths) = parse_flags(&args(&["a"]), BLOCKS_512).unwrap();
+    assert!(!opts.dedupe_clones);
     assert_eq!(paths, args(&["a"]));
 
     // "--" ends option parsing so odd paths remain reachable
-    let (clones, paths) = parse_flags(&args(&["--", "--dedupe-clones"])).unwrap();
-    assert!(!clones);
-    assert_eq!(paths, args(&["--dedupe-clones"]));
+    let (opts, paths) = parse_flags(&args(&["--", "--dedupe-clones", "-h"]), BLOCKS_512).unwrap();
+    assert!(!opts.dedupe_clones);
+    assert_eq!(paths, args(&["--dedupe-clones", "-h"]));
 
-    assert!(parse_flags(&args(&["--nope", "a"])).is_err());
+    assert!(parse_flags(&args(&["--nope", "a"]), BLOCKS_512).is_err());
+    assert!(parse_flags(&args(&["-x", "a"]), BLOCKS_512).is_err());
+}
+
+#[test]
+fn test_parse_flags_size_format() {
+    let format = |v: &[&str]| parse_flags(&args(v), BLOCKS_512).unwrap().0.format;
+
+    assert_eq!(format(&["a"]), BLOCKS_512);
+    assert_eq!(format(&["-h", "a"]), SizeFormat::Human { base: 1024 });
+    assert_eq!(format(&["--si", "a"]), SizeFormat::Human { base: 1000 });
+    assert_eq!(format(&["-k", "a"]), SizeFormat::Blocks { unit: 1024 });
+    assert_eq!(format(&["-m", "a"]), SizeFormat::Blocks { unit: 1 << 20 });
+    assert_eq!(format(&["-g", "a"]), SizeFormat::Blocks { unit: 1 << 30 });
+    assert_eq!(format(&["-B", "4k", "a"]), SizeFormat::Blocks { unit: 4096 });
+    assert_eq!(format(&["-B4k", "a"]), SizeFormat::Blocks { unit: 4096 });
+
+    // Options combine, and the last size option wins
+    assert_eq!(format(&["-hk", "a"]), SizeFormat::Blocks { unit: 1024 });
+    assert_eq!(format(&["-kh", "a"]), SizeFormat::Human { base: 1024 });
+    assert_eq!(format(&["-k", "--si", "a"]), SizeFormat::Human { base: 1000 });
+    assert_eq!(format(&["--si", "-B", "1m", "a"]), SizeFormat::Blocks { unit: 1 << 20 });
+
+    // The default is what BLOCKSIZE supplies, and a size option overrides it
+    let default = SizeFormat::Blocks { unit: 1024 };
+    let (opts, _) = parse_flags(&args(&["a"]), default).unwrap();
+    assert_eq!(opts.format, default);
+    let (opts, _) = parse_flags(&args(&["-h", "a"]), default).unwrap();
+    assert_eq!(opts.format, SizeFormat::Human { base: 1024 });
+
+    assert!(parse_flags(&args(&["-B"]), BLOCKS_512).is_err());
+    assert!(parse_flags(&args(&["-B", "zero", "a"]), BLOCKS_512).is_err());
+    assert!(parse_flags(&args(&["-Q", "a"]), BLOCKS_512).is_err());
+}
+
+#[test]
+fn test_parse_block_size() {
+    assert_eq!(parse_block_size("512"), Some(512));
+    assert_eq!(parse_block_size("1k"), Some(1024));
+    assert_eq!(parse_block_size("1K"), Some(1024));
+    assert_eq!(parse_block_size("2m"), Some(2 << 20));
+    assert_eq!(parse_block_size("1g"), Some(1 << 30));
+    // Rounded up to a multiple of 512, as du does
+    assert_eq!(parse_block_size("1000"), Some(1024));
+    assert_eq!(parse_block_size("513"), Some(1024));
+    assert_eq!(parse_block_size("0"), None);
+    assert_eq!(parse_block_size("k"), None);
+    assert_eq!(parse_block_size("1x"), None);
+    assert_eq!(parse_block_size(""), None);
+}
+
+#[test]
+fn test_block_counts_match_du_units() {
+    // 4 KiB file, as du -k, -m and -g report it
+    let four_kib = SizeFormat::Blocks { unit: 1024 }.format(8);
+    assert_eq!(four_kib, "4");
+    assert_eq!(SizeFormat::Blocks { unit: 1 << 20 }.format(8), "1");
+    assert_eq!(SizeFormat::Blocks { unit: 1 << 30 }.format(8), "1");
+    // Partial units round up: 1 GiB + 100 MiB is 2 GiB
+    assert_eq!(SizeFormat::Blocks { unit: 1 << 30 }.format(2_099_200), "2");
+    // Default output is 512-byte blocks
+    assert_eq!(BLOCKS_512.format(8), "8");
+}
+
+#[test]
+fn test_human_sizes_match_du() {
+    let human = SizeFormat::Human { base: 1024 };
+    // Blocks are 512 bytes; the byte counts in the comments are what du -h printed
+    assert_eq!(human.format(0), "  0B");
+    assert_eq!(human.format(8), "4.0K"); // 4096 bytes
+    assert_eq!(human.format(208), "104K"); // 106496 bytes
+    assert_eq!(human.format(1016), "508K"); // 520192 bytes
+    assert_eq!(human.format(8000), "3.9M"); // 4096000 bytes
+    assert_eq!(human.format(20560), " 10M"); // 10526720 bytes
+    assert_eq!(human.format(2_097_152), "1.0G"); // 1 GiB
+    assert_eq!(human.format(2_097_152 * 40), " 40G");
+
+    let si = SizeFormat::Human { base: 1000 };
+    assert_eq!(si.format(8), "4.1k"); // 4096 bytes
+    assert_eq!(si.format(80), " 41k"); // 40960 bytes
+    assert_eq!(si.format(8000), "4.1M"); // 4096000 bytes
+}
+
+#[test]
+fn test_human_sizes_roll_over_to_next_unit() {
+    // du shows 1000 KiB as 1.0M, so anything printing as 1000 or more moves up a unit
+    let human = SizeFormat::Human { base: 1024 };
+    assert_eq!(human.format(2000), "1.0M"); // 1000 KiB
+    assert_eq!(human.format(2040), "1.0M"); // 1020 KiB
+    assert_eq!(human.format(1960), "980K"); // 980 KiB stays in K
+    assert_eq!(human.format(2047), "1.0M"); // 1023.5 KiB
 }
 
 #[test]
@@ -416,6 +511,42 @@ fn test_cli_dedupe_clones_flag() {
     let out = Command::new(env!("CARGO_BIN_EXE_dumac"))
         .arg("--unknown")
         .arg(root)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn test_cli_size_format_flags() {
+    let _guard = serial();
+    let temp_dir = TempDir::new().unwrap();
+    let file = temp_dir.path().join("one_mib");
+    write_file(&file, 1 << 20);
+    let run = |args: &[&str], blocksize: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dumac"));
+        cmd.env_remove("BLOCKSIZE").args(args).arg(&file);
+        if let Some(value) = blocksize {
+            cmd.env("BLOCKSIZE", value);
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).split('\t').next().unwrap().to_string()
+    };
+
+    // A 1 MiB file is 2048 512-byte blocks
+    assert_eq!(run(&[], None), "2048");
+    assert_eq!(run(&["-k"], None), "1024");
+    assert_eq!(run(&["-m"], None), "1");
+    assert_eq!(run(&["-B", "4k"], None), "256");
+    assert_eq!(run(&["-h"], None), "1.0M");
+    assert_eq!(run(&["--si"], None), "1.0M");
+    assert_eq!(run(&[], Some("1k")), "1024");
+    // Flags override BLOCKSIZE
+    assert_eq!(run(&["-m"], Some("1k")), "1");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_dumac"))
+        .args(["-B", "zero"])
+        .arg(&file)
         .output()
         .unwrap();
     assert!(!out.status.success());

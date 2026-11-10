@@ -12,8 +12,21 @@ It's a parallelized version of `du -sh` and uses highly efficient macOS syscalls
 
 ```bash
 dumac /tmp/
-11.5K   /tmp/
+17714352	/tmp/
+dumac -h /tmp/
+8.4G	/tmp/
 ```
+
+Output follows `du`: block counts in 512-byte units by default (or `BLOCKSIZE` if set), and these flags change the unit, as with `du`:
+
+| Flag | Output |
+| --- | --- |
+| `-h` | human-readable, powers of 1024 (`4.0K`, `104K`, `1.0G`) |
+| `--si` | human-readable, powers of 1000 (`4.1k`, `41M`) |
+| `-k`, `-m`, `-g` | 1 KiB, 1 MiB or 1 GiB blocks |
+| `-B size` | blocks of `size` bytes; accepts `k`, `m` or `g` suffixes, e.g. `-B 4k` |
+
+Flags can be combined (`-hk`), and the last size flag wins. Use `--` to end option parsing before a path that starts with a dash.
 
 Multiple paths and quoted glob patterns are supported (`*`, `?`, `[...]`, `**`). Hardlinks shared between paths are counted once.
 

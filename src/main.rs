@@ -118,41 +118,77 @@ fn blocks_from_bytes(bytes: i64) -> i64 {
     (bytes + 511) / 512
 }
 
-// Convert blocks to human readable format (du -h style)
-fn format_size(blocks: i64) -> String {
-    let bytes = blocks * 512;
+// How sizes are printed, matching du's output units
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeFormat {
+    // Block count in units of `unit` bytes, rounded up (default 512, -k, -m, -g, -B)
+    Blocks { unit: i64 },
+    // Human-readable with powers of `base` (1024 for -h, 1000 for --si)
+    Human { base: i64 },
+}
 
-    if bytes < 1024 {
-        format!("{}B", bytes)
-    } else if bytes < 1024 * 1024 {
-        let kb = bytes as f64 / 1024.0;
-        if kb.fract() == 0.0 {
-            format!("{}K", kb as i64)
-        } else {
-            format!("{:.1}K", kb)
-        }
-    } else if bytes < 1024 * 1024 * 1024 {
-        let mb = bytes as f64 / (1024.0 * 1024.0);
-        if mb.fract() == 0.0 {
-            format!("{}M", mb as i64)
-        } else {
-            format!("{:.1}M", mb)
-        }
-    } else if bytes < 1024_i64.pow(4) {
-        let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        if gb.fract() == 0.0 {
-            format!("{}G", gb as i64)
-        } else {
-            format!("{:.1}G", gb)
-        }
-    } else {
-        let tb = bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0);
-        if tb.fract() == 0.0 {
-            format!("{}T", tb as i64)
-        } else {
-            format!("{:.1}T", tb)
+impl SizeFormat {
+    pub fn format(self, blocks: i64) -> String {
+        match self {
+            SizeFormat::Blocks { unit } => ((blocks * 512 + unit - 1) / unit).to_string(),
+            SizeFormat::Human { base } => format_human(blocks * 512, base),
         }
     }
+}
+
+// du -h style: one decimal place below 10 units, whole numbers from 10 up, rounded to
+// the nearest. Anything that would print as 1000 or more moves up a unit, so 1000K
+// is shown as 1.0M, as du does. Right-aligned in four columns, like du.
+fn format_human(bytes: i64, base: i64) -> String {
+    let suffixes = if base == 1000 {
+        ['B', 'k', 'M', 'G', 'T', 'P']
+    } else {
+        ['B', 'K', 'M', 'G', 'T', 'P']
+    };
+    let base_f = base as f64;
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= base_f && unit + 1 < suffixes.len() {
+        value /= base_f;
+        unit += 1;
+    }
+    loop {
+        let decimal = unit > 0 && value < 9.95;
+        let rounded = if decimal {
+            (value * 10.0).round() / 10.0
+        } else {
+            value.round()
+        };
+        if rounded >= 1000.0 && unit + 1 < suffixes.len() {
+            value /= base_f;
+            unit += 1;
+            continue;
+        }
+        let number = if decimal {
+            format!("{:.1}", value)
+        } else {
+            format!("{:.0}", value)
+        };
+        return format!("{:>3}{}", number, suffixes[unit]);
+    }
+}
+
+// Block size from -B or BLOCKSIZE: a byte count with an optional k, m or g suffix
+// (powers of 1024), rounded up to a multiple of 512 as du does.
+pub fn parse_block_size(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(d) = lower.strip_suffix('k') {
+        (d, 1_i64 << 10)
+    } else if let Some(d) = lower.strip_suffix('m') {
+        (d, 1_i64 << 20)
+    } else if let Some(d) = lower.strip_suffix('g') {
+        (d, 1_i64 << 30)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let count = digits.parse::<i64>().ok().filter(|&n| n > 0)?;
+    let bytes = count.checked_mul(multiplier)?;
+    Some((bytes + 511) / 512 * 512)
 }
 
 fn is_dot_or_dotdot(filename: &str) -> bool {
@@ -232,29 +268,84 @@ fn worker_threads() -> usize {
         .min(MAX_FILE_HANDLES)
 }
 
-// Split leading options from paths. Only "--" prefixed options exist, so a path
-// starting with a single dash still works; "--" ends option parsing.
-pub fn parse_flags(args: &[String]) -> Result<(bool, Vec<String>), String> {
-    let mut dedupe_clones = false;
+#[derive(Debug, PartialEq, Eq)]
+pub struct Options {
+    pub dedupe_clones: bool,
+    pub format: SizeFormat,
+}
+
+// Split options from paths. Short options can be combined (-hk), and -B takes its
+// value attached or as the next argument. "--" ends option parsing, so a path that
+// starts with a dash stays reachable. Later size options override earlier ones.
+pub fn parse_flags(
+    args: &[String],
+    default_format: SizeFormat,
+) -> Result<(Options, Vec<String>), String> {
+    let mut options = Options {
+        dedupe_clones: false,
+        format: default_format,
+    };
     let mut operands = Vec::new();
     let mut options_done = false;
-    for arg in args {
-        match arg.as_str() {
-            "--" if !options_done => options_done = true,
-            "--dedupe-clones" if !options_done => dedupe_clones = true,
-            a if !options_done && a.starts_with("--") => {
-                return Err(format!("unrecognized option '{}'", a))
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if options_done || arg == "-" || !arg.starts_with('-') {
+            operands.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            options_done = true;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "dedupe-clones" => options.dedupe_clones = true,
+                "si" => options.format = SizeFormat::Human { base: 1000 },
+                _ => return Err(format!("unrecognized option '{}'", arg)),
             }
-            _ => operands.push(arg.clone()),
+            continue;
+        }
+        let cluster = &arg[1..];
+        for (i, c) in cluster.char_indices() {
+            match c {
+                'h' => options.format = SizeFormat::Human { base: 1024 },
+                'k' => options.format = SizeFormat::Blocks { unit: 1 << 10 },
+                'm' => options.format = SizeFormat::Blocks { unit: 1 << 20 },
+                'g' => options.format = SizeFormat::Blocks { unit: 1 << 30 },
+                'B' => {
+                    let attached = &cluster[i + 1..];
+                    let value = if attached.is_empty() {
+                        rest.next()
+                            .ok_or_else(|| "option requires an argument -- 'B'".to_string())?
+                            .as_str()
+                    } else {
+                        attached
+                    };
+                    let unit = parse_block_size(value)
+                        .ok_or_else(|| format!("invalid block size '{}'", value))?;
+                    options.format = SizeFormat::Blocks { unit };
+                    break;
+                }
+                _ => return Err(format!("illegal option -- {}", c)),
+            }
         }
     }
-    Ok((dedupe_clones, operands))
+    Ok((options, operands))
+}
+
+// du's default unit is BLOCKSIZE when set, otherwise 512-byte blocks
+fn default_size_format() -> SizeFormat {
+    let unit = env::var("BLOCKSIZE")
+        .ok()
+        .and_then(|v| parse_block_size(&v))
+        .unwrap_or(512);
+    SizeFormat::Blocks { unit }
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let (dedupe_clones, operands) = match parse_flags(&args[1..]) {
+    let (options, operands) = match parse_flags(&args[1..], default_size_format()) {
         Ok(parsed) => parsed,
         Err(msg) => {
             eprintln!("{}: {}", args[0], msg);
@@ -262,10 +353,13 @@ fn main() {
         }
     };
     if operands.is_empty() {
-        eprintln!("usage: {} [--dedupe-clones] path [path ...]", args[0]);
+        eprintln!(
+            "usage: {} [-g | -h | -k | -m | --si | -B blocksize] [--dedupe-clones] path [path ...]",
+            args[0]
+        );
         std::process::exit(1);
     }
-    set_dedupe_clones(dedupe_clones);
+    set_dedupe_clones(options.dedupe_clones);
 
     let (roots, expand_errors) = expand_args(&operands);
     let mut failed = !expand_errors.is_empty();
@@ -281,9 +375,23 @@ fn main() {
         .build()
         .expect("Failed to build thread pool");
 
-    for root in roots {
-        match pool.install(|| size_of_path(root.clone())) {
-            Ok(total_blocks) => println!("{}\t{}", format_size(total_blocks), root),
+    // Roots are independent, so walk them concurrently. Collect before printing:
+    // rayon's indexed collect preserves argument order, and buffering keeps
+    // interleaved `println!` lines from splitting mid-record. A root that fails
+    // still prints its error, in its original position relative to the others.
+    let results: Vec<(String, Result<i64, String>)> = pool.install(|| {
+        roots
+            .into_par_iter()
+            .map(|root| {
+                let size = size_of_path(root.clone());
+                (root, size)
+            })
+            .collect()
+    });
+
+    for (root, result) in results {
+        match result {
+            Ok(total_blocks) => println!("{}\t{}", options.format.format(total_blocks), root),
             Err(e) => {
                 eprintln!("{}: {}", args[0], e);
                 failed = true;
