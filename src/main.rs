@@ -308,6 +308,8 @@ pub fn parse_flags(
         let cluster = &arg[1..];
         for (i, c) in cluster.char_indices() {
             match c {
+                // dumac already prints one total per operand, which is what du -s prints
+                's' => {}
                 'h' => options.format = SizeFormat::Human { base: 1024 },
                 'k' => options.format = SizeFormat::Blocks { unit: 1 << 10 },
                 'm' => options.format = SizeFormat::Blocks { unit: 1 << 20 },

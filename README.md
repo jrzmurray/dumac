@@ -26,7 +26,7 @@ Output follows `du`: block counts in 512-byte units by default (or `BLOCKSIZE` i
 | `-k`, `-m`, `-g` | 1 KiB, 1 MiB or 1 GiB blocks |
 | `-B size` | blocks of `size` bytes; accepts `k`, `m` or `g` suffixes, e.g. `-B 4k` |
 
-Flags can be combined (`-hk`), and the last size flag wins. Use `--` to end option parsing before a path that starts with a dash.
+`-s` is accepted for `du` compatibility (`du -sh` works as is). dumac always prints one total per path, so it has no effect. Flags can be combined (`-sh`, `-hk`), and the last size flag wins. Use `--` to end option parsing before a path that starts with a dash.
 
 Multiple paths and quoted glob patterns are supported (`*`, `?`, `[...]`, `**`). Hardlinks shared between paths are counted once.
 

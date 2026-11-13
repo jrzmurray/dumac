@@ -345,6 +345,10 @@ fn test_parse_flags_size_format() {
     assert_eq!(format(&["-B", "4k", "a"]), SizeFormat::Blocks { unit: 4096 });
     assert_eq!(format(&["-B4k", "a"]), SizeFormat::Blocks { unit: 4096 });
 
+    // -s is accepted (dumac already prints one total per operand), so du's -sh works
+    assert_eq!(format(&["-sh", "a"]), SizeFormat::Human { base: 1024 });
+    assert_eq!(format(&["-s", "a"]), BLOCKS_512);
+
     // Options combine, and the last size option wins
     assert_eq!(format(&["-hk", "a"]), SizeFormat::Blocks { unit: 1024 });
     assert_eq!(format(&["-kh", "a"]), SizeFormat::Human { base: 1024 });
